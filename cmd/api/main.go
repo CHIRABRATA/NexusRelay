@@ -10,19 +10,17 @@ import (
 )
 
 func main() {
-	// 1. Load configuration
 	cfg := config.LoadConfig()
 
-	// 2. Initialize HTTP router (ServeMux)
 	mux := http.NewServeMux()
 
-	// 3. Register route routes
+	// Register routes
 	mux.HandleFunc("GET /healthz", handler.HealthCheck)
+	mux.HandleFunc("POST /api/v1/events", handler.CreateEvent)
 
-	// 4. Start HTTP Server
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	log.Printf("NexusRelay API starting on port %s in %s mode...", cfg.Port, cfg.Environment)
-	
+
 	err := http.ListenAndServe(addr, mux)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
