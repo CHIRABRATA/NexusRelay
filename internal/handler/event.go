@@ -1,66 +1,82 @@
 package handler
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
+	"github.com/CHIRABRATA/NexusRelay/internal/queue"
 )
 
-// CreateEvent handles POST /api/v1/events
-func CreateEvent(w http.ResponseWriter, r *http.Request) {
+type EventHandler struct {
+	DB    *sql.DB
+	Queue *queue.RedisQueue
+}
+
+func NewEventHandler(db *sql.DB, q *queue.RedisQueue) *EventHandler {
+	return &EventHandler{DB: db, Queue: q}
+}
+
+func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// 1. Parse JSON body
 	var req model.EventRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "Invalid JSON payload",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON payload"})
 		return
 	}
 
-	// 2. Validate input fields
 	if req.EventType == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "event_type is required",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"error": "event_type is required"})
 		return
 	}
 
-	if req.SubscriberURL == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "subscriber_url is required",
-		})
-		return
-	}
-
-	// 3. Validate URL format
-	_, err = url.ParseRequestURI(req.SubscriberURL)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "invalid subscriber_url format",
-		})
-		return
-	}
-
-	// 4. Construct response with generated UUID
 	eventID := uuid.New().String()
-	resp := model.EventResponse{
-		ID:        eventID,
-		Status:    "QUEUED",
-		CreatedAt: time.Now().UTC(),
+
+	// 1. Fetch matching active subscribers from PostgreSQL
+	rows, err := h.DB.Query("SELECT id, url, secret_key FROM subscribers WHERE event_type = $1", req.EventType)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to fetch subscribers"})
+		return
+	}
+	defer rows.Close()
+
+	var jobsEnqueued int
+	for rows.Next() {
+		var subID, subURL, secretKey string
+		if err := rows.Scan(&subID, &subURL, &secretKey); err != nil {
+			continue
+		}
+
+		// 2. Construct job payload
+		job := &model.Job{
+			ID:            uuid.New().String(),
+			EventID:       eventID,
+			SubscriberID:  subID,
+			SubscriberURL: subURL,
+			SecretKey:     secretKey,
+			Payload:       req.Payload,
+			Attempts:      0,
+			CreatedAt:     time.Now().UTC(),
+		}
+
+		// 3. Push job to Redis queue
+		if err := h.Queue.Push(r.Context(), job); err == nil {
+			jobsEnqueued++
+		}
 	}
 
-	// 5. Return HTTP 202 Accepted
+	// 4. Return HTTP 202 Accepted
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"event_id":      eventID,
+		"status":        "QUEUED",
+		"jobs_enqueued": jobsEnqueued,
+	})
 }

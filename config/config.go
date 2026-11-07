@@ -1,8 +1,6 @@
 package config
 
-import (
-	"os"
-)
+import "os"
 
 type Config struct {
 	Port        string
@@ -12,6 +10,7 @@ type Config struct {
 	DBUser      string
 	DBPassword  string
 	DBName      string
+	RedisAddr   string
 }
 
 func LoadConfig() *Config {
@@ -23,6 +22,7 @@ func LoadConfig() *Config {
 		DBUser:      getEnv("DB_USER", "postgres"),
 		DBPassword:  getEnv("DB_PASSWORD", "postgres"),
 		DBName:      getEnv("DB_NAME", "nexusrelay"),
+		RedisAddr:   getEnv("REDIS_ADDR", "localhost:6379"),
 	}
 }
 
