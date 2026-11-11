@@ -9,20 +9,23 @@ import (
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
+	"github.com/CHIRABRATA/NexusRelay/internal/retry"
 )
 
 type WorkerPool struct {
 	WorkerCount int
 	Queue       *queue.RedisQueue
 	Dispatcher  *dispatcher.HTTPDispatcher
+	RetryCfg    *retry.BackoffConfig
 	wg          sync.WaitGroup
 }
 
-func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher) *WorkerPool {
+func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig) *WorkerPool {
 	return &WorkerPool{
 		WorkerCount: workerCount,
 		Queue:       q,
 		Dispatcher:  d,
+		RetryCfg:    rCfg,
 	}
 }
 
@@ -65,19 +68,41 @@ func (p *WorkerPool) worker(ctx context.Context, workerID int) {
 }
 
 func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Job) {
-	log.Printf("[Worker %d] 🚀 Dispatching Job ID: %s | Target: %s", workerID, job.ID, job.SubscriberURL)
+	log.Printf("[Worker %d] 🚀 Dispatching Job ID: %s (Attempt %d/%d) | Target: %s",
+		workerID, job.ID, job.Attempts+1, p.RetryCfg.MaxAttempts, job.SubscriberURL)
 
-	// Create 10-second timeout per HTTP dispatch attempt
 	dispatchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	err := p.Dispatcher.Dispatch(dispatchCtx, job)
-	if err != nil {
-		log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s: %v", workerID, job.ID, err)
+	if err == nil {
+		log.Printf("[Worker %d] ✅ Dispatch Success for Job ID: %s", workerID, job.ID)
 		return
 	}
 
-	log.Printf("[Worker %d] ✅ Dispatch Success for Job ID: %s", workerID, job.ID)
+	// Increment attempt counter
+	job.Attempts++
+	log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s (Attempt %d/%d): %v",
+		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, err)
+
+	// Check if retry limit is reached
+	if job.Attempts >= p.RetryCfg.MaxAttempts {
+		log.Printf("[Worker %d] 💀 Max retries (%d) reached for Job ID: %s. Dropping job.",
+			workerID, p.RetryCfg.MaxAttempts, job.ID)
+		return
+	}
+
+	// Calculate exponential backoff delay with jitter
+	backoffDelay := retry.CalculateBackoff(job.Attempts, p.RetryCfg)
+	log.Printf("[Worker %d] ⏳ Scheduling Retry for Job ID %s in %v", workerID, job.ID, backoffDelay)
+
+	// Re-enqueue job back into Redis after delay in a background goroutine
+	go func(j *model.Job, delay time.Duration) {
+		time.Sleep(delay)
+		if err := p.Queue.Push(context.Background(), j); err != nil {
+			log.Printf("Failed to re-enqueue retry job %s: %v", j.ID, err)
+		}
+	}(job, backoffDelay)
 }
 
 func (p *WorkerPool) Stop() {
