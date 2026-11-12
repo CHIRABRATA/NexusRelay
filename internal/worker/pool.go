@@ -9,6 +9,7 @@ import (
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
+	"github.com/CHIRABRATA/NexusRelay/internal/repository"
 	"github.com/CHIRABRATA/NexusRelay/internal/retry"
 )
 
@@ -17,15 +18,17 @@ type WorkerPool struct {
 	Queue       *queue.RedisQueue
 	Dispatcher  *dispatcher.HTTPDispatcher
 	RetryCfg    *retry.BackoffConfig
+	DLQRepo     *repository.DLQRepository
 	wg          sync.WaitGroup
 }
 
-func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig) *WorkerPool {
+func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig, dlq *repository.DLQRepository) *WorkerPool {
 	return &WorkerPool{
 		WorkerCount: workerCount,
 		Queue:       q,
 		Dispatcher:  d,
 		RetryCfg:    rCfg,
+		DLQRepo:     dlq,
 	}
 }
 
@@ -80,23 +83,24 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 		return
 	}
 
-	// Increment attempt counter
 	job.Attempts++
 	log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s (Attempt %d/%d): %v",
 		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, err)
 
-	// Check if retry limit is reached
+	// Exhausted retries -> Persist to DLQ in PostgreSQL
 	if job.Attempts >= p.RetryCfg.MaxAttempts {
-		log.Printf("[Worker %d] 💀 Max retries (%d) reached for Job ID: %s. Dropping job.",
-			workerID, p.RetryCfg.MaxAttempts, job.ID)
+		log.Printf("[Worker %d] 📦 Persisting Job ID %s to PostgreSQL Dead Letter Queue (DLQ)...", workerID, job.ID)
+		if dlqErr := p.DLQRepo.Save(job, err.Error()); dlqErr != nil {
+			log.Printf("[Worker %d] 🚨 Failed to save job to DLQ: %v", workerID, dlqErr)
+		} else {
+			log.Printf("[Worker %d] 💾 Successfully saved Job ID %s to DLQ", workerID, job.ID)
+		}
 		return
 	}
 
-	// Calculate exponential backoff delay with jitter
 	backoffDelay := retry.CalculateBackoff(job.Attempts, p.RetryCfg)
 	log.Printf("[Worker %d] ⏳ Scheduling Retry for Job ID %s in %v", workerID, job.ID, backoffDelay)
 
-	// Re-enqueue job back into Redis after delay in a background goroutine
 	go func(j *model.Job, delay time.Duration) {
 		time.Sleep(delay)
 		if err := p.Queue.Push(context.Background(), j); err != nil {

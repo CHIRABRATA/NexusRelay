@@ -16,6 +16,7 @@ import (
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/handler"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
+	"github.com/CHIRABRATA/NexusRelay/internal/repository"
 	"github.com/CHIRABRATA/NexusRelay/internal/retry"
 	"github.com/CHIRABRATA/NexusRelay/internal/worker"
 )
@@ -36,19 +37,22 @@ func main() {
 
 	httpDispatcher := dispatcher.NewHTTPDispatcher(10 * time.Second)
 	retryCfg := retry.DefaultConfig()
+	dlqRepo := repository.NewDLQRepository(db)
 
 	workerCtx, cancelWorkerCtx := context.WithCancel(context.Background())
 
-	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg)
+	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo)
 	workerPool.Start(workerCtx)
 
 	subHandler := handler.NewSubscriberHandler(db)
 	eventHandler := handler.NewEventHandler(db, redisQueue)
+	dlqHandler := handler.NewDLQHandler(dlqRepo)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.HealthCheck)
 	mux.HandleFunc("POST /api/v1/subscribers", subHandler.RegisterSubscriber)
 	mux.HandleFunc("POST /api/v1/events", eventHandler.CreateEvent)
+	mux.HandleFunc("GET /api/v1/dlq", dlqHandler.GetDLQJobs)
 
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	server := &http.Server{

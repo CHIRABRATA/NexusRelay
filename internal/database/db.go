@@ -8,7 +8,6 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// InitDB initializes and checks the PostgreSQL connection pool
 func InitDB(host, port, user, password, dbname string) (*sql.DB, error) {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		host, port, user, password, dbname)
@@ -18,18 +17,15 @@ func InitDB(host, port, user, password, dbname string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	// Set connection pool settings
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 
-	// Verify database connectivity
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
 
 	log.Println("Successfully connected to PostgreSQL database")
 
-	// Ensure subscribers table exists
 	if err := createTables(db); err != nil {
 		return nil, err
 	}
@@ -46,6 +42,17 @@ func createTables(db *sql.DB) error {
 		event_type VARCHAR(100) NOT NULL,
 		secret_key VARCHAR(64) NOT NULL,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS dead_letter_jobs (
+		id VARCHAR(36) PRIMARY KEY,
+		event_id VARCHAR(36) NOT NULL,
+		subscriber_id VARCHAR(36) NOT NULL,
+		subscriber_url TEXT NOT NULL,
+		payload JSONB NOT NULL,
+		attempts INT NOT NULL,
+		last_error TEXT NOT NULL,
+		failed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err := db.Exec(query)
