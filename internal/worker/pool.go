@@ -19,16 +19,18 @@ type WorkerPool struct {
 	Dispatcher  *dispatcher.HTTPDispatcher
 	RetryCfg    *retry.BackoffConfig
 	DLQRepo     *repository.DLQRepository
+	LogRepo     *repository.DeliveryLogRepository
 	wg          sync.WaitGroup
 }
 
-func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig, dlq *repository.DLQRepository) *WorkerPool {
+func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig, dlq *repository.DLQRepository, logRepo *repository.DeliveryLogRepository) *WorkerPool {
 	return &WorkerPool{
 		WorkerCount: workerCount,
 		Queue:       q,
 		Dispatcher:  d,
 		RetryCfg:    rCfg,
 		DLQRepo:     dlq,
+		LogRepo:     logRepo,
 	}
 }
 
@@ -77,15 +79,34 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 	dispatchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	err := p.Dispatcher.Dispatch(dispatchCtx, job)
+	startTime := time.Now()
+	statusCode, err := p.Dispatcher.Dispatch(dispatchCtx, job)
+	durationMs := time.Since(startTime).Milliseconds()
+
+	if p.LogRepo != nil {
+		var errMsg string
+		if err != nil {
+			errMsg = err.Error()
+		}
+		_ = p.LogRepo.Record(repository.DeliveryLog{
+			JobID:        job.ID,
+			EventID:      job.EventID,
+			SubscriberID: job.SubscriberID,
+			Attempt:      job.Attempts + 1,
+			StatusCode:   statusCode,
+			DurationMs:   durationMs,
+			ErrorMessage: errMsg,
+			CreatedAt:    time.Now().UTC(),
+		})
+	}
 	if err == nil {
-		log.Printf("[Worker %d] ✅ Dispatch Success for Job ID: %s", workerID, job.ID)
+		log.Printf("[Worker %d] ✅ Dispatch Success for Job ID: %s (Status: %d)", workerID, job.ID, statusCode)
 		return
 	}
 
 	job.Attempts++
-	log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s (Attempt %d/%d): %v",
-		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, err)
+	log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s (Attempt %d/%d, Status: %d): %v",
+		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, statusCode, err)
 
 	// Exhausted retries -> Persist to DLQ in PostgreSQL
 	if job.Attempts >= p.RetryCfg.MaxAttempts {

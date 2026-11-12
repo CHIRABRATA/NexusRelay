@@ -10,15 +10,41 @@ import (
 	"github.com/google/uuid"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
+	"github.com/CHIRABRATA/NexusRelay/internal/repository"
 )
 
 type EventHandler struct {
-	DB    *sql.DB
-	Queue *queue.RedisQueue
+	DB      *sql.DB
+	Queue   *queue.RedisQueue
+	LogRepo *repository.DeliveryLogRepository
 }
 
-func NewEventHandler(db *sql.DB, q *queue.RedisQueue) *EventHandler {
-	return &EventHandler{DB: db, Queue: q}
+func NewEventHandler(db *sql.DB, q *queue.RedisQueue, logRepo *repository.DeliveryLogRepository) *EventHandler {
+	return &EventHandler{DB: db, Queue: q, LogRepo: logRepo}
+}
+
+// GetEventDeliveries handles GET /api/v1/events/{id}/deliveries
+func (h *EventHandler) GetEventDeliveries(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	eventID := r.PathValue("id")
+	logs, err := h.LogRepo.GetByEventID(eventID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to fetch delivery logs"})
+		return
+	}
+
+	if logs == nil {
+		logs = []repository.DeliveryLog{}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"event_id":   eventID,
+		"attempts":   len(logs),
+		"deliveries": logs,
+	})
 }
 
 func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {

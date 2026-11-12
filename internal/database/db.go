@@ -53,7 +53,21 @@ func createTables(db *sql.DB) error {
 		attempts INT NOT NULL,
 		last_error TEXT NOT NULL,
 		failed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-	);`
+	);
+
+	CREATE TABLE IF NOT EXISTS delivery_logs (
+		id VARCHAR(36) PRIMARY KEY,
+		job_id VARCHAR(36) NOT NULL,
+		event_id VARCHAR(36) NOT NULL,
+		subscriber_id VARCHAR(36) NOT NULL,
+		attempt INT NOT NULL,
+		status_code INT NOT NULL,
+		duration_ms BIGINT NOT NULL,
+		error_message TEXT,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_delivery_logs_event_id ON delivery_logs(event_id);`
 
 	_, err := db.Exec(query)
 	return err

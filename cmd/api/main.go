@@ -38,22 +38,23 @@ func main() {
 	httpDispatcher := dispatcher.NewHTTPDispatcher(10 * time.Second)
 	retryCfg := retry.DefaultConfig()
 	dlqRepo := repository.NewDLQRepository(db)
+	logRepo := repository.NewDeliveryLogRepository(db)
 
 	workerCtx, cancelWorkerCtx := context.WithCancel(context.Background())
 
-	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo)
+	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo, logRepo)
 	workerPool.Start(workerCtx)
 
 	subHandler := handler.NewSubscriberHandler(db)
-	eventHandler := handler.NewEventHandler(db, redisQueue)
-	dlqHandler := handler.NewDLQHandler(dlqRepo,redisQueue)
+	eventHandler := handler.NewEventHandler(db, redisQueue, logRepo)
+	dlqHandler := handler.NewDLQHandler(dlqRepo, redisQueue)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.HealthCheck)
 	mux.HandleFunc("POST /api/v1/subscribers", subHandler.RegisterSubscriber)
 	mux.HandleFunc("POST /api/v1/events", eventHandler.CreateEvent)
+	mux.HandleFunc("GET /api/v1/events/{id}/deliveries", eventHandler.GetEventDeliveries)
 	mux.HandleFunc("GET /api/v1/dlq", dlqHandler.GetDLQJobs)
-	
 	mux.HandleFunc("POST /api/v1/dlq/{id}/retry", dlqHandler.RetryDLQJob)
 
 	addr := fmt.Sprintf(":%s", cfg.Port)
