@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -23,6 +24,33 @@ func NewEventHandler(db *sql.DB, q *queue.RedisQueue) *EventHandler {
 func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	// 1. Check Idempotency-Key header if supplied
+	idemKey := r.Header.Get("Idempotency-Key")
+	var redisIdemKey string
+
+	if idemKey != "" {
+		redisIdemKey = fmt.Sprintf("nexus:idem:%s", idemKey)
+
+		// Check if response is already cached
+		cachedResp, err := h.Queue.Client.Get(r.Context(), redisIdemKey).Result()
+		if err == nil && cachedResp != "" && cachedResp != "PROCESSING" {
+			w.Header().Set("X-Idempotent-Replay", "true")
+			w.WriteHeader(http.StatusAccepted)
+			w.Write([]byte(cachedResp))
+			return
+		}
+
+		// Atomically acquire lock for 24 hours
+		acquired, err := h.Queue.Client.SetNX(r.Context(), redisIdemKey, "PROCESSING", 24*time.Hour).Result()
+		if err == nil && !acquired {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Duplicate request currently in flight",
+			})
+			return
+		}
+	}
+
 	var req model.EventRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -38,7 +66,6 @@ func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 
 	eventID := uuid.New().String()
 
-	// 1. Fetch matching active subscribers from PostgreSQL
 	rows, err := h.DB.Query("SELECT id, url, secret_key FROM subscribers WHERE event_type = $1", req.EventType)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -54,7 +81,6 @@ func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 2. Construct job payload
 		job := &model.Job{
 			ID:            uuid.New().String(),
 			EventID:       eventID,
@@ -66,17 +92,23 @@ func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:     time.Now().UTC(),
 		}
 
-		// 3. Push job to Redis queue
 		if err := h.Queue.Push(r.Context(), job); err == nil {
 			jobsEnqueued++
 		}
 	}
 
-	// 4. Return HTTP 202 Accepted
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	respObj := map[string]interface{}{
 		"event_id":      eventID,
 		"status":        "QUEUED",
 		"jobs_enqueued": jobsEnqueued,
-	})
+	}
+	respBytes, _ := json.Marshal(respObj)
+
+	// Store final response in Redis under Idempotency-Key
+	if redisIdemKey != "" {
+		_ = h.Queue.Client.Set(r.Context(), redisIdemKey, string(respBytes), 24*time.Hour).Err()
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	w.Write(respBytes)
 }

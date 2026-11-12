@@ -46,13 +46,15 @@ func main() {
 
 	subHandler := handler.NewSubscriberHandler(db)
 	eventHandler := handler.NewEventHandler(db, redisQueue)
-	dlqHandler := handler.NewDLQHandler(dlqRepo)
+	dlqHandler := handler.NewDLQHandler(dlqRepo,redisQueue)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.HealthCheck)
 	mux.HandleFunc("POST /api/v1/subscribers", subHandler.RegisterSubscriber)
 	mux.HandleFunc("POST /api/v1/events", eventHandler.CreateEvent)
 	mux.HandleFunc("GET /api/v1/dlq", dlqHandler.GetDLQJobs)
+	
+	mux.HandleFunc("POST /api/v1/dlq/{id}/retry", dlqHandler.RetryDLQJob)
 
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	server := &http.Server{

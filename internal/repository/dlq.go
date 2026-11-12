@@ -3,6 +3,7 @@ package repository
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -28,7 +29,6 @@ func NewDLQRepository(db *sql.DB) *DLQRepository {
 	return &DLQRepository{DB: db}
 }
 
-// Save stores a permanently failed job into the PostgreSQL dead_letter_jobs table
 func (r *DLQRepository) Save(job *model.Job, lastErr string) error {
 	payloadBytes, err := json.Marshal(job.Payload)
 	if err != nil {
@@ -43,7 +43,6 @@ func (r *DLQRepository) Save(job *model.Job, lastErr string) error {
 	return err
 }
 
-// FetchAll retrieves all dead-lettered jobs
 func (r *DLQRepository) FetchAll() ([]DLQJob, error) {
 	query := `SELECT id, event_id, subscriber_id, subscriber_url, payload, attempts, last_error, failed_at FROM dead_letter_jobs ORDER BY failed_at DESC`
 	rows, err := r.DB.Query(query)
@@ -66,4 +65,37 @@ func (r *DLQRepository) FetchAll() ([]DLQJob, error) {
 	}
 
 	return jobs, nil
+}
+
+// GetByID fetches a single dead-lettered job along with the subscriber's current secret_key
+func (r *DLQRepository) GetByID(id string) (*model.Job, error) {
+	query := `
+	SELECT d.id, d.event_id, d.subscriber_id, s.url, s.secret_key, d.payload
+	FROM dead_letter_jobs d
+	JOIN subscribers s ON d.subscriber_id = s.id
+	WHERE d.id = $1`
+
+	var job model.Job
+	var payloadBytes []byte
+
+	err := r.DB.QueryRow(query, id).Scan(
+		&job.ID, &job.EventID, &job.SubscriberID, &job.SubscriberURL, &job.SecretKey, &payloadBytes,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	_ = json.Unmarshal(payloadBytes, &job.Payload)
+	job.Attempts = 0
+	job.CreatedAt = time.Now().UTC()
+	return &job, nil
+}
+
+// Delete removes a job from the DLQ once re-enqueued
+func (r *DLQRepository) Delete(id string) error {
+	_, err := r.DB.Exec("DELETE FROM dead_letter_jobs WHERE id = $1", id)
+	return err
 }
