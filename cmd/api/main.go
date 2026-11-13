@@ -63,6 +63,9 @@ func main() {
 	dlqHandler := handler.NewDLQHandler(dlqRepo, redisQueue)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "web/index.html")
+	})
 	mux.HandleFunc("GET /healthz", handler.HealthCheck)
 	mux.Handle("GET /metrics", metricsCollector)
 	mux.HandleFunc("POST /api/v1/subscribers", subHandler.RegisterSubscriber)
@@ -74,7 +77,7 @@ func main() {
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      withCORS(mux),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -106,4 +109,18 @@ func main() {
 	workerPool.Stop()
 
 	log.Println("NexusRelay shutdown complete. Goodbye!")
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
