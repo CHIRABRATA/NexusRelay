@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/CHIRABRATA/NexusRelay/internal/circuitbreaker"
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/limiter"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
@@ -22,10 +23,20 @@ type WorkerPool struct {
 	DLQRepo     *repository.DLQRepository
 	LogRepo     *repository.DeliveryLogRepository
 	Limiter     *limiter.SubscriberLimiter
+	Breaker     *circuitbreaker.Manager
 	wg          sync.WaitGroup
 }
 
-func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig, dlq *repository.DLQRepository, logRepo *repository.DeliveryLogRepository, lim *limiter.SubscriberLimiter) *WorkerPool {
+func NewWorkerPool(
+	workerCount int,
+	q *queue.RedisQueue,
+	d *dispatcher.HTTPDispatcher,
+	rCfg *retry.BackoffConfig,
+	dlq *repository.DLQRepository,
+	logRepo *repository.DeliveryLogRepository,
+	lim *limiter.SubscriberLimiter,
+	cb *circuitbreaker.Manager,
+) *WorkerPool {
 	return &WorkerPool{
 		WorkerCount: workerCount,
 		Queue:       q,
@@ -34,6 +45,7 @@ func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispa
 		DLQRepo:     dlq,
 		LogRepo:     logRepo,
 		Limiter:     lim,
+		Breaker:     cb,
 	}
 }
 
@@ -76,7 +88,7 @@ func (p *WorkerPool) worker(ctx context.Context, workerID int) {
 }
 
 func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Job) {
-	// Check per-subscriber token bucket before dispatching
+	// 1. Per-Subscriber Rate Limiter Check
 	if p.Limiter != nil && !p.Limiter.Allow(job.SubscriberID) {
 		log.Printf("[Worker %d] 🚦 Rate limit exceeded for Subscriber %s. Deferring Job ID %s by 500ms",
 			workerID, job.SubscriberID, job.ID)
@@ -90,6 +102,21 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 		return
 	}
 
+	// 2. Per-Subscriber Circuit Breaker Check
+	if p.Breaker != nil {
+		state, cbErr := p.Breaker.Allow(job.SubscriberID)
+		if cbErr != nil {
+			log.Printf("[Worker %d] ⚡ Circuit %s for Subscriber %s — Fast-failing Job ID %s without network call",
+				workerID, state, job.SubscriberID, job.ID)
+			p.handleFailure(workerID, job, 0, 0, cbErr)
+			return
+		}
+		if state == circuitbreaker.StateHalfOpen {
+			log.Printf("[Worker %d] 🩺 Circuit HALF-OPEN for Subscriber %s — Sending probe Job ID %s",
+				workerID, job.SubscriberID, job.ID)
+		}
+	}
+
 	attemptNum := job.Attempts + 1
 	log.Printf("[Worker %d] 🚀 Dispatching Job ID: %s (Attempt %d/%d) | Target: %s",
 		workerID, job.ID, attemptNum, p.RetryCfg.MaxAttempts, job.SubscriberURL)
@@ -97,36 +124,64 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 	dispatchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	startTime := time.Now()
+	start := time.Now()
 	statusCode, err := p.Dispatcher.Dispatch(dispatchCtx, job)
-	durationMs := time.Since(startTime).Milliseconds()
+	durationMs := time.Since(start).Milliseconds()
 
-	if p.LogRepo != nil {
-		var errMsg string
-		if err != nil {
-			errMsg = err.Error()
-		}
-		_ = p.LogRepo.Record(repository.DeliveryLog{
-			JobID:        job.ID,
-			EventID:      job.EventID,
-			SubscriberID: job.SubscriberID,
-			Attempt:      job.Attempts + 1,
-			StatusCode:   statusCode,
-			DurationMs:   durationMs,
-			ErrorMessage: errMsg,
-			CreatedAt:    time.Now().UTC(),
-		})
-	}
 	if err == nil {
+		// Record audit log & reset circuit breaker on success
+		if p.LogRepo != nil {
+			_ = p.LogRepo.Record(repository.DeliveryLog{
+				JobID:        job.ID,
+				EventID:      job.EventID,
+				SubscriberID: job.SubscriberID,
+				Attempt:      attemptNum,
+				StatusCode:   statusCode,
+				DurationMs:   durationMs,
+			})
+		}
+
+		if p.Breaker != nil {
+			if transitioned, newState := p.Breaker.RecordSuccess(job.SubscriberID); transitioned {
+				log.Printf("[Worker %d] 🟢 Circuit transitioned to %s for Subscriber %s",
+					workerID, newState, job.SubscriberID)
+			}
+		}
+
 		log.Printf("[Worker %d] ✅ Dispatch Success for Job ID: %s (Status: %d)", workerID, job.ID, statusCode)
 		return
 	}
 
-	job.Attempts++
-	log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s (Attempt %d/%d, Status: %d): %v",
-		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, statusCode, err)
+	// Record failure in circuit breaker
+	if p.Breaker != nil {
+		if transitioned, newState := p.Breaker.RecordFailure(job.SubscriberID); transitioned {
+			log.Printf("[Worker %d] 🔴 Circuit TRIPPED to %s for Subscriber %s after repeated failures!",
+				workerID, newState, job.SubscriberID)
+		}
+	}
 
-	// Exhausted retries -> Persist to DLQ in PostgreSQL
+	p.handleFailure(workerID, job, statusCode, durationMs, err)
+}
+
+func (p *WorkerPool) handleFailure(workerID int, job *model.Job, statusCode int, durationMs int64, err error) {
+	attemptNum := job.Attempts + 1
+
+	if p.LogRepo != nil {
+		_ = p.LogRepo.Record(repository.DeliveryLog{
+			JobID:        job.ID,
+			EventID:      job.EventID,
+			SubscriberID: job.SubscriberID,
+			Attempt:      attemptNum,
+			StatusCode:   statusCode,
+			DurationMs:   durationMs,
+			ErrorMessage: err.Error(),
+		})
+	}
+
+	job.Attempts++
+	log.Printf("[Worker %d] ❌ Dispatch Failed for Job ID %s (Attempt %d/%d): %v",
+		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, err)
+
 	if job.Attempts >= p.RetryCfg.MaxAttempts {
 		log.Printf("[Worker %d] 📦 Persisting Job ID %s to PostgreSQL Dead Letter Queue (DLQ)...", workerID, job.ID)
 		if dlqErr := p.DLQRepo.Save(job, err.Error()); dlqErr != nil {

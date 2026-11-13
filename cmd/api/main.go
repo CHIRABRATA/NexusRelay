@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/CHIRABRATA/NexusRelay/config"
+	"github.com/CHIRABRATA/NexusRelay/internal/circuitbreaker"
 	"github.com/CHIRABRATA/NexusRelay/internal/database"
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/handler"
@@ -40,11 +41,12 @@ func main() {
 	retryCfg := retry.DefaultConfig()
 	dlqRepo := repository.NewDLQRepository(db)
 	logRepo := repository.NewDeliveryLogRepository(db)
-	subLimiter := limiter.NewSubscriberLimiter(2, 2) // 2 req/sec, burst 2
+	subLimiter := limiter.NewSubscriberLimiter(2, 2)
+	cbManager := circuitbreaker.NewManager(3, 15*time.Second)
 
 	workerCtx, cancelWorkerCtx := context.WithCancel(context.Background())
 
-	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo, logRepo, subLimiter)
+	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo, logRepo, subLimiter, cbManager)
 	workerPool.Start(workerCtx)
 
 	subHandler := handler.NewSubscriberHandler(db)
