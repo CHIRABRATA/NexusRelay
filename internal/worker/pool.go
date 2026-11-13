@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
+	"github.com/CHIRABRATA/NexusRelay/internal/limiter"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
 	"github.com/CHIRABRATA/NexusRelay/internal/repository"
@@ -20,10 +21,11 @@ type WorkerPool struct {
 	RetryCfg    *retry.BackoffConfig
 	DLQRepo     *repository.DLQRepository
 	LogRepo     *repository.DeliveryLogRepository
+	Limiter     *limiter.SubscriberLimiter
 	wg          sync.WaitGroup
 }
 
-func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig, dlq *repository.DLQRepository, logRepo *repository.DeliveryLogRepository) *WorkerPool {
+func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispatcher, rCfg *retry.BackoffConfig, dlq *repository.DLQRepository, logRepo *repository.DeliveryLogRepository, lim *limiter.SubscriberLimiter) *WorkerPool {
 	return &WorkerPool{
 		WorkerCount: workerCount,
 		Queue:       q,
@@ -31,6 +33,7 @@ func NewWorkerPool(workerCount int, q *queue.RedisQueue, d *dispatcher.HTTPDispa
 		RetryCfg:    rCfg,
 		DLQRepo:     dlq,
 		LogRepo:     logRepo,
+		Limiter:     lim,
 	}
 }
 
@@ -73,8 +76,23 @@ func (p *WorkerPool) worker(ctx context.Context, workerID int) {
 }
 
 func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Job) {
+	// Check per-subscriber token bucket before dispatching
+	if p.Limiter != nil && !p.Limiter.Allow(job.SubscriberID) {
+		log.Printf("[Worker %d] 🚦 Rate limit exceeded for Subscriber %s. Deferring Job ID %s by 500ms",
+			workerID, job.SubscriberID, job.ID)
+
+		go func(j *model.Job) {
+			time.Sleep(500 * time.Millisecond)
+			if err := p.Queue.Push(context.Background(), j); err != nil {
+				log.Printf("Failed to re-enqueue throttled job %s: %v", j.ID, err)
+			}
+		}(job)
+		return
+	}
+
+	attemptNum := job.Attempts + 1
 	log.Printf("[Worker %d] 🚀 Dispatching Job ID: %s (Attempt %d/%d) | Target: %s",
-		workerID, job.ID, job.Attempts+1, p.RetryCfg.MaxAttempts, job.SubscriberURL)
+		workerID, job.ID, attemptNum, p.RetryCfg.MaxAttempts, job.SubscriberURL)
 
 	dispatchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
