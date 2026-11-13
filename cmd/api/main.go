@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/handler"
 	"github.com/CHIRABRATA/NexusRelay/internal/limiter"
+	"github.com/CHIRABRATA/NexusRelay/internal/metrics"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
 	"github.com/CHIRABRATA/NexusRelay/internal/repository"
 	"github.com/CHIRABRATA/NexusRelay/internal/retry"
@@ -24,6 +26,12 @@ import (
 )
 
 func main() {
+	// Configure structured JSON logging globally
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	cfg := config.LoadConfig()
 
 	db, err := database.InitDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName)
@@ -43,18 +51,20 @@ func main() {
 	logRepo := repository.NewDeliveryLogRepository(db)
 	subLimiter := limiter.NewSubscriberLimiter(2, 2)
 	cbManager := circuitbreaker.NewManager(3, 15*time.Second)
+	metricsCollector := metrics.NewCollector(redisQueue)
 
 	workerCtx, cancelWorkerCtx := context.WithCancel(context.Background())
 
-	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo, logRepo, subLimiter, cbManager)
+	workerPool := worker.NewWorkerPool(3, redisQueue, httpDispatcher, retryCfg, dlqRepo, logRepo, subLimiter, cbManager, metricsCollector)
 	workerPool.Start(workerCtx)
 
 	subHandler := handler.NewSubscriberHandler(db)
-	eventHandler := handler.NewEventHandler(db, redisQueue, logRepo)
+	eventHandler := handler.NewEventHandler(db, redisQueue, logRepo, metricsCollector)
 	dlqHandler := handler.NewDLQHandler(dlqRepo, redisQueue)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.HealthCheck)
+	mux.Handle("GET /metrics", metricsCollector)
 	mux.HandleFunc("POST /api/v1/subscribers", subHandler.RegisterSubscriber)
 	mux.HandleFunc("POST /api/v1/events", eventHandler.CreateEvent)
 	mux.HandleFunc("GET /api/v1/events/{id}/deliveries", eventHandler.GetEventDeliveries)

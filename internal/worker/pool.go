@@ -3,12 +3,14 @@ package worker
 import (
 	"context"
 	"log"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/CHIRABRATA/NexusRelay/internal/circuitbreaker"
 	"github.com/CHIRABRATA/NexusRelay/internal/dispatcher"
 	"github.com/CHIRABRATA/NexusRelay/internal/limiter"
+	"github.com/CHIRABRATA/NexusRelay/internal/metrics"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
 	"github.com/CHIRABRATA/NexusRelay/internal/repository"
@@ -24,6 +26,7 @@ type WorkerPool struct {
 	LogRepo     *repository.DeliveryLogRepository
 	Limiter     *limiter.SubscriberLimiter
 	Breaker     *circuitbreaker.Manager
+	Metrics     *metrics.Collector
 	wg          sync.WaitGroup
 }
 
@@ -36,6 +39,7 @@ func NewWorkerPool(
 	logRepo *repository.DeliveryLogRepository,
 	lim *limiter.SubscriberLimiter,
 	cb *circuitbreaker.Manager,
+	m *metrics.Collector,
 ) *WorkerPool {
 	return &WorkerPool{
 		WorkerCount: workerCount,
@@ -46,6 +50,7 @@ func NewWorkerPool(
 		LogRepo:     logRepo,
 		Limiter:     lim,
 		Breaker:     cb,
+		Metrics:     m,
 	}
 }
 
@@ -90,6 +95,14 @@ func (p *WorkerPool) worker(ctx context.Context, workerID int) {
 func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Job) {
 	// 1. Per-Subscriber Rate Limiter Check
 	if p.Limiter != nil && !p.Limiter.Allow(job.SubscriberID) {
+		if p.Metrics != nil {
+			p.Metrics.RateLimitedDeferred.Add(1)
+		}
+		slog.Warn("rate limit exceeded, deferring job",
+			"worker_id", workerID,
+			"subscriber_id", job.SubscriberID,
+			"job_id", job.ID,
+		)
 		log.Printf("[Worker %d] 🚦 Rate limit exceeded for Subscriber %s. Deferring Job ID %s by 500ms",
 			workerID, job.SubscriberID, job.ID)
 
@@ -141,6 +154,17 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 			})
 		}
 
+		if p.Metrics != nil {
+			p.Metrics.DispatchedSuccess.Add(1)
+		}
+		slog.Info("webhook dispatched successfully",
+			"worker_id", workerID,
+			"job_id", job.ID,
+			"event_id", job.EventID,
+			"status_code", statusCode,
+			"duration_ms", durationMs,
+		)
+
 		if p.Breaker != nil {
 			if transitioned, newState := p.Breaker.RecordSuccess(job.SubscriberID); transitioned {
 				log.Printf("[Worker %d] 🟢 Circuit transitioned to %s for Subscriber %s",
@@ -155,6 +179,9 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 	// Record failure in circuit breaker
 	if p.Breaker != nil {
 		if transitioned, newState := p.Breaker.RecordFailure(job.SubscriberID); transitioned {
+			if p.Metrics != nil {
+				p.Metrics.CircuitBreakerTrips.Add(1)
+			}
 			log.Printf("[Worker %d] 🔴 Circuit TRIPPED to %s for Subscriber %s after repeated failures!",
 				workerID, newState, job.SubscriberID)
 		}
@@ -164,6 +191,10 @@ func (p *WorkerPool) processJob(ctx context.Context, workerID int, job *model.Jo
 }
 
 func (p *WorkerPool) handleFailure(workerID int, job *model.Job, statusCode int, durationMs int64, err error) {
+	if p.Metrics != nil {
+		p.Metrics.DispatchedFailed.Add(1)
+	}
+
 	attemptNum := job.Attempts + 1
 
 	if p.LogRepo != nil {
@@ -183,6 +214,16 @@ func (p *WorkerPool) handleFailure(workerID int, job *model.Job, statusCode int,
 		workerID, job.ID, job.Attempts, p.RetryCfg.MaxAttempts, err)
 
 	if job.Attempts >= p.RetryCfg.MaxAttempts {
+		if p.Metrics != nil {
+			p.Metrics.DLQPersisted.Add(1)
+		}
+		slog.Error("job exhausted retries, persisted to DLQ",
+			"worker_id", workerID,
+			"job_id", job.ID,
+			"event_id", job.EventID,
+			"attempts", job.Attempts,
+		)
+
 		log.Printf("[Worker %d] 📦 Persisting Job ID %s to PostgreSQL Dead Letter Queue (DLQ)...", workerID, job.ID)
 		if dlqErr := p.DLQRepo.Save(job, err.Error()); dlqErr != nil {
 			log.Printf("[Worker %d] 🚨 Failed to save job to DLQ: %v", workerID, dlqErr)

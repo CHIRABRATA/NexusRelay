@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/CHIRABRATA/NexusRelay/internal/metrics"
 	"github.com/CHIRABRATA/NexusRelay/internal/model"
 	"github.com/CHIRABRATA/NexusRelay/internal/queue"
 	"github.com/CHIRABRATA/NexusRelay/internal/repository"
@@ -17,10 +18,11 @@ type EventHandler struct {
 	DB      *sql.DB
 	Queue   *queue.RedisQueue
 	LogRepo *repository.DeliveryLogRepository
+	Metrics *metrics.Collector
 }
 
-func NewEventHandler(db *sql.DB, q *queue.RedisQueue, logRepo *repository.DeliveryLogRepository) *EventHandler {
-	return &EventHandler{DB: db, Queue: q, LogRepo: logRepo}
+func NewEventHandler(db *sql.DB, q *queue.RedisQueue, logRepo *repository.DeliveryLogRepository, m *metrics.Collector) *EventHandler {
+	return &EventHandler{DB: db, Queue: q, LogRepo: logRepo, Metrics: m}
 }
 
 // GetEventDeliveries handles GET /api/v1/events/{id}/deliveries
@@ -129,6 +131,10 @@ func (h *EventHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		"jobs_enqueued": jobsEnqueued,
 	}
 	respBytes, _ := json.Marshal(respObj)
+
+	if h.Metrics != nil {
+		h.Metrics.EventsIngested.Add(1)
+	}
 
 	// Store final response in Redis under Idempotency-Key
 	if redisIdemKey != "" {
